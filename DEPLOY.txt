@@ -1,0 +1,16 @@
+Vercel deployment
+1. Upload/push all files in this folder to the GitHub repository connected to Vercel.
+2. Vercel should detect the Express backend automatically.
+3. Redeploy after the files are committed.
+4. Open the deployed URL. It should return JSON with `"ok": true`.
+5. Socket.IO endpoint remains `/socket.io`.
+6. In the client, use the deployed HTTPS origin and force WebSocket transport.
+
+Example:
+const socket = io('https://ice-hockey-server.vercel.app', {
+  transports: ['websocket']
+});
+
+Do not use `/api/socket-io/socket.io` for this package.
+
+For production persistence, move player stats, usernames, rewarded-ad counters, and cross-instance room/pub-sub state to durable external storage.
