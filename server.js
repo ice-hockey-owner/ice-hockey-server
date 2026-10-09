@@ -83,7 +83,7 @@ function startMatch(p1,p2,roomId){
   const startAt=Date.now()+2100;
   const p1Profile={name:p1.playerName||'Player 1',avatar:p1.playerAvatar||'',customization:cleanCustomization(p1.playerCustomization||{})};
   const p2Profile={name:p2.playerName||'Player 2',avatar:p2.playerAvatar||'',customization:cleanCustomization(p2.playerCustomization||{})};
-  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,profiles:{left:p1Profile,right:p2Profile}};
+  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,scores:{left:0,right:0},profiles:{left:p1Profile,right:p2Profile}};
   p1.join(roomId); p2.join(roomId);
   // The room keeps an immutable snapshot for this match. Each client receives
   // BOTH players' profiles, so the renderer never has to guess whose cosmetic belongs where.
@@ -350,7 +350,7 @@ io.on('connection', (socket) => {
     if (data.profile && typeof data.profile === 'object') { const accepted=acceptProfileForSocket(socket,data.profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
     const code = Math.random().toString(36).substring(2, 8).toUpperCase();
     socket.join(code);
-    rooms[code] = { p1: socket.id, p2: null, startAt: null, ended: false };
+    rooms[code] = { p1: socket.id, p2: null, startAt: null, ended: false, scores: { left: 0, right: 0 } };
     socket.emit('room_created', { code });
   });
 
@@ -367,13 +367,23 @@ io.on('connection', (socket) => {
   socket.on('player_move', data => { const room=rooms[data?.room]; if(!room) return; if(socket.id!==room.p1 && socket.id!==room.p2) return; const x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return; socket.to(data.room).emit('opponent_move',{x,y}); });
   socket.on('puck_update', data => socket.to(data.room).emit('puck_update', data));
   socket.on('score_update', data => {
-    const room=rooms[data.room]; if(!room || room.ended) return;
-    if(data.scorer==='left' || data.scorer==='right') {
-      const scorerId=data.scorer==='left'?room.p1:room.p2;
-      const scorer=io.sockets.sockets.get(scorerId);
-      if(scorer?.playerName){ const k=key(scorer.playerName); const st=cleanStats(playerStats[k]); st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats(); scorer.emit('stats_updated',{name:scorer.playerName,stats:st}); }
+    const room=rooms[data?.room]; if(!room || room.ended) return;
+    // Only the left-side client simulates puck physics and may report a goal.
+    // This avoids both clients incrementing the score for the same puck crossing.
+    if(socket.id !== room.p1) return;
+    const scorerSide=data?.scorer;
+    if(scorerSide!=='left' && scorerSide!=='right') return;
+    if(!room.scores) room.scores={left:0,right:0};
+    // Accept exactly one goal at a time; ignore stale, duplicate, or fabricated score totals.
+    room.scores[scorerSide] += 1;
+    const scorerId=scorerSide==='left'?room.p1:room.p2;
+    const scorer=io.sockets.sockets.get(scorerId);
+    if(scorer?.playerName){
+      const k=key(scorer.playerName); const st=cleanStats(playerStats[k]);
+      st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats();
+      scorer.emit('stats_updated',{name:scorer.playerName,stats:st});
     }
-    io.to(data.room).emit('score_update', data);
+    io.to(data.room).emit('score_update', {...data, scores:{...room.scores}, scorer:scorerSide});
   });
 
   socket.on('rewarded_ad_status', () => {
