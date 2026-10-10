@@ -34,7 +34,7 @@ const io = new Server(server, {
 app.use(express.static(__dirname));
 app.get('/api/leaderboard', (req,res) => {
   res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.json({period:String(req.query.period||'all'), rows:getLeaderboardRows(req.query.period)});
+  res.json(getLeaderboardRows(req.query.period));
 });
 
 const idPhotoDir = path.join(__dirname, 'assets', 'images', 'IdPhotos');
