@@ -57,8 +57,10 @@ const friends = new Map();        // name -> Set(friend names)
 const chatHistory = new Map();   // sorted pair -> recent messages
 const rematchChallenges = new Map(); // target name -> challenger name
 const MAX_FRIENDS = 250;
-const statsFile = path.join(__dirname, 'player-stats.json');
-const goalEventsFile = path.join(__dirname, 'goal-events.json');
+const dataDir = process.env.DATA_DIR || __dirname;
+try { fs.mkdirSync(dataDir, { recursive: true }); } catch {}
+const statsFile = path.join(dataDir, 'player-stats.json');
+const goalEventsFile = path.join(dataDir, 'goal-events.json');
 let goalEvents = [];
 try { goalEvents = JSON.parse(fs.readFileSync(goalEventsFile, 'utf8')) || []; } catch { goalEvents = []; }
 function saveGoalEvents(){ try { fs.writeFileSync(goalEventsFile, JSON.stringify(goalEvents.slice(-200000), null, 2)); } catch {} }
@@ -75,8 +77,8 @@ function leaderboardWindow(period){
   if(period === 'monthly') return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
   return 0;
 }
-const namesFile = path.join(__dirname, 'reserved-names.json');
-const rewardFile = path.join(__dirname, 'rewarded-ads.json');
+const namesFile = path.join(dataDir, 'reserved-names.json');
+const rewardFile = path.join(dataDir, 'rewarded-ads.json');
 let reservedNames = {};
 let rewardedAds = {};
 try { reservedNames = JSON.parse(fs.readFileSync(namesFile, 'utf8')) || {}; } catch { reservedNames = {}; }
