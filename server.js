@@ -34,7 +34,7 @@ const io = new Server(server, {
 app.use(express.static(__dirname));
 app.get('/api/leaderboard', (req,res) => {
   res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
-  res.json(getLeaderboardRows());
+  res.json({period:String(req.query.period||'all'), rows:getLeaderboardRows(req.query.period)});
 });
 
 const idPhotoDir = path.join(__dirname, 'assets', 'images', 'IdPhotos');
@@ -58,6 +58,23 @@ const chatHistory = new Map();   // sorted pair -> recent messages
 const rematchChallenges = new Map(); // target name -> challenger name
 const MAX_FRIENDS = 250;
 const statsFile = path.join(__dirname, 'player-stats.json');
+const goalEventsFile = path.join(__dirname, 'goal-events.json');
+let goalEvents = [];
+try { goalEvents = JSON.parse(fs.readFileSync(goalEventsFile, 'utf8')) || []; } catch { goalEvents = []; }
+function saveGoalEvents(){ try { fs.writeFileSync(goalEventsFile, JSON.stringify(goalEvents.slice(-200000), null, 2)); } catch {} }
+function recordGoal(name){
+  const playerName = normalizeName(name);
+  if(!playerName) return;
+  goalEvents.push({name:playerName, at:Date.now()});
+  if(goalEvents.length > 200000) goalEvents = goalEvents.slice(-200000);
+  saveGoalEvents();
+}
+function leaderboardWindow(period){
+  const now = new Date();
+  if(period === 'weekly') return Date.now() - 7*24*60*60*1000;
+  if(period === 'monthly') return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
+  return 0;
+}
 const namesFile = path.join(__dirname, 'reserved-names.json');
 const rewardFile = path.join(__dirname, 'rewarded-ads.json');
 let reservedNames = {};
@@ -72,7 +89,26 @@ let playerStats = {};
 try { playerStats = JSON.parse(fs.readFileSync(statsFile, 'utf8')) || {}; } catch { playerStats = {}; }
 function cleanStats(st){ const games=Number(st?.gamesPlayed)||0,wins=Number(st?.wins)||0,losses=Number(st?.losses)||0,goals=Number(st?.goals)||0; return {gamesPlayed:games,wins,losses,goals,winRate:games?Math.round(wins/games*100):0}; }
 function saveStats(){ try { fs.writeFileSync(statsFile, JSON.stringify(playerStats,null,2)); } catch {} }
-function getLeaderboardRows(){ return Object.entries(playerStats).map(([k, st]) => ({ name: st.name || k, goals: Number(st.goals)||0 })).sort((a,b)=>b.goals-a.goals || a.name.localeCompare(b.name)).slice(0,100); }
+function getLeaderboardRows(period='all'){
+  const normalized = String(period || 'all').toLowerCase();
+  let rows;
+  if(normalized === 'weekly' || normalized === 'monthly'){
+    const since = leaderboardWindow(normalized);
+    const counts = new Map();
+    for(const event of goalEvents){
+      if(Number(event?.at) < since) continue;
+      const name = normalizeName(event?.name);
+      if(!name) continue;
+      const k = key(name);
+      const entry = counts.get(k) || {name, goals:0};
+      entry.goals++; counts.set(k, entry);
+    }
+    rows = Array.from(counts.values());
+  } else {
+    rows = Object.entries(playerStats).map(([k, st]) => ({ name: st.name || k, goals: Number(st.goals)||0 }));
+  }
+  return rows.sort((a,b)=>b.goals-a.goals || a.name.localeCompare(b.name)).slice(0,100);
+}
 
 function chatKey(a,b){ return [key(a),key(b)].sort().join('::'); }
 function pushChatMessage(a,b,payload){
@@ -210,8 +246,10 @@ io.on('connection', (socket) => {
     socket.emit('player_stats', { name: target, stats: cleanStats(playerStats[key(target)]), avatar: targetSocket?.playerAvatar || '', online: !!targetSocket });
   });
 
-  socket.on('get_leaderboard', (callback) => {
-    const rows = getLeaderboardRows();
+  socket.on('get_leaderboard', (payload, callback) => {
+    // Backward-compatible with old clients that emit only a callback.
+    if(typeof payload === 'function'){ callback = payload; payload = {}; }
+    const rows = getLeaderboardRows(payload?.period || 'all');
     if (typeof callback === 'function') callback(rows);
     socket.emit('leaderboard_data', rows);
   });
@@ -380,7 +418,7 @@ io.on('connection', (socket) => {
     const scorer=io.sockets.sockets.get(scorerId);
     if(scorer?.playerName){
       const k=key(scorer.playerName); const st=cleanStats(playerStats[k]);
-      st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats();
+      st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats(); recordGoal(scorer.playerName);
       scorer.emit('stats_updated',{name:scorer.playerName,stats:st});
     }
     io.to(data.room).emit('score_update', {...data, scores:{...room.scores}, scorer:scorerSide});
