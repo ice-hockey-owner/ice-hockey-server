@@ -17,6 +17,6 @@ to the URL Render assigned to your service. Do not guess the URL; use the exact 
 
 ## Verify
 - Open `https://YOUR-ACTUAL-SERVICE-URL/health`; it should return `{"ok":true}`.
-- Open `https://YOUR-ACTUAL-SERVICE-URL/api/leaderboard?period=all`; it should return a JSON object with `rows`.
+- Open `https://YOUR-ACTUAL-SERVICE-URL/api/leaderboard?period=all`; it should return a JSON array of leaderboard rows.
 - Open the game in two separate browsers/devices and press Quick Match at nearly the same time. Both should enter a real-player match.
 - Weekly leaderboard uses a rolling last 7 days. Monthly leaderboard uses the current calendar month. All Time uses the persisted total goals.
