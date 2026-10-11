@@ -68,6 +68,7 @@ const statsFile = path.join(dataDir, 'player-stats.json');
 const goalEventsFile = path.join(dataDir, 'goal-events.json');
 const namesFile = path.join(dataDir, 'reserved-names.json');
 const rewardFile = path.join(dataDir, 'rewarded-ads.json');
+const walletsFile = path.join(dataDir, 'player-wallets.json');
 
 // ---- Persistence --------------------------------------------------------
 // The old code called fs.writeFileSync (pretty-printed, up to 200k goal events)
@@ -117,12 +118,16 @@ function leaderboardWindow(period){
 }
 let reservedNames = {};
 let rewardedAds = {};
+let playerWallets = {};
 try { reservedNames = JSON.parse(fs.readFileSync(namesFile, 'utf8')) || {}; } catch { reservedNames = {}; }
 try { rewardedAds = JSON.parse(fs.readFileSync(rewardFile, 'utf8')) || {}; } catch { rewardedAds = {}; }
+try { playerWallets = JSON.parse(fs.readFileSync(walletsFile, 'utf8')) || {}; } catch { playerWallets = {}; }
 const namesSaver = makeSaver(namesFile, () => reservedNames);
 const rewardSaver = makeSaver(rewardFile, () => rewardedAds);
+const walletsSaver = makeSaver(walletsFile, () => playerWallets);
 function saveReservedNames(){ namesSaver.schedule(); }
 function saveRewardedAds(){ rewardSaver.schedule(); }
+function saveWallets(){ walletsSaver.schedule(); }
 function rewardDay(){ return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()); }
 function profileKey(data){ return String(data?.profileId || '').trim().slice(0,80); }
 let playerStats = {};
@@ -160,7 +165,7 @@ function startMatch(p1,p2,roomId){
   const startAt=Date.now()+2100;
   const p1Profile={name:p1.playerName||'Player 1',avatar:p1.playerAvatar||'',customization:cleanCustomization(p1.playerCustomization||{})};
   const p2Profile={name:p2.playerName||'Player 2',avatar:p2.playerAvatar||'',customization:cleanCustomization(p2.playerCustomization||{})};
-  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,lastGoalAt:0,scores:{left:0,right:0},profiles:{left:p1Profile,right:p2Profile}};
+  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,lastGoalAt:0,scores:{left:0,right:0},profiles:{left:p1Profile,right:p2Profile},lastPuckState:null};
   p1.join(roomId); p2.join(roomId);
   // The room keeps an immutable snapshot for this match. Each client receives
   // BOTH players' profiles, so the renderer never has to guess whose cosmetic belongs where.
@@ -281,6 +286,28 @@ function cleanCustomization(c={}) {
     trail: CUSTOMIZATION_OPTIONS.trail.has(c.trail) ? c.trail : 'trail-blue'
   };
 }
+const CUSTOM_ITEM_COSTS = {
+  frame:{'frame-classic':0,'frame-ice':30,'frame-ruby':50,'frame-gold':80,'frame-neon':110,'frame-aurora':140,'frame-frost':170,'frame-cosmic':210},
+  player:{'player-blue':0,'player-red':0,'player-violet':50,'player-mint':80,'player-gold':110},
+  font:{'font-ocean':0,'font-royal':30,'font-tropical':50,'font-sunset':80,'font-aqua':110,'font-aurora':140,'font-candy':170,'font-icefire':210},
+  trail:{'trail-blue':0,'trail-purple':60,'trail-aurora':90,'trail-fire':120,'trail-gold':150}
+};
+function walletKey(socket){return String(socket.profileId||'').trim().slice(0,80);}
+function getWallet(socket){
+  const id=walletKey(socket);if(!id)return null;
+  if(!playerWallets[id])playerWallets[id]={coins:0,owned:{frame:['frame-classic'],player:['player-blue','player-red'],font:['font-ocean'],trail:['trail-blue']},equipped:{frame:'frame-classic',player:'player-blue',font:'font-ocean',trail:'trail-blue'}};
+  const w=playerWallets[id];w.coins=Math.max(0,Math.floor(Number(w.coins)||0));
+  if(!w.owned||typeof w.owned!=='object')w.owned={frame:['frame-classic'],player:['player-blue','player-red'],font:['font-ocean'],trail:['trail-blue']};
+  if(!w.equipped||typeof w.equipped!=='object')w.equipped={frame:'frame-classic',player:'player-blue',font:'font-ocean',trail:'trail-blue'};
+  return w;
+}
+function walletSnapshot(socket){
+  const w=getWallet(socket);if(!w)return null;const owned={};
+  for(const cat of Object.keys(CUSTOM_ITEM_COSTS))owned[cat]=Array.isArray(w.owned[cat])?w.owned[cat].filter(id=>Object.hasOwn(CUSTOM_ITEM_COSTS[cat],id)):[];
+  return {coins:w.coins,owned,equipped:cleanCustomization(w.equipped)};
+}
+function emitWallet(socket){const state=walletSnapshot(socket);if(state)socket.emit('wallet_state',state);}
+function awardGoalCoins(socket,amount=5){const w=getWallet(socket);if(!w)return;w.coins=Math.min(100000000,w.coins+amount);saveWallets();socket.emit('wallet_update',walletSnapshot(socket));}
 function emitFriendState(name) {
   const k = key(name);
   const socketId = onlineByName.get(k);
@@ -357,8 +384,19 @@ io.on('connection', (socket) => {
     // Do not broadcast later profile edits into an active match.
     emitFriendState(socket.playerName);
     socket.emit('profile_accepted', {name:socket.playerName, profileId:socket.profileId, avatar:socket.playerAvatar});
+    emitWallet(socket);
   });
 
+  socket.on('wallet_get', () => emitWallet(socket));
+  socket.on('wallet_purchase', (data={},ack) => {
+    const cat=String(data.category||'');const id=String(data.itemId||'');const costs=CUSTOM_ITEM_COSTS[cat];
+    if(!costs||!Object.hasOwn(costs,id)){if(typeof ack==='function')ack({ok:false,message:'Unknown customization item.'});return;}
+    const w=getWallet(socket);if(!w){if(typeof ack==='function')ack({ok:false,message:'Profile is not ready.'});return;}
+    if(!Array.isArray(w.owned[cat]))w.owned[cat]=[];
+    if(!w.owned[cat].includes(id)){const cost=costs[id];if(w.coins<cost){if(typeof ack==='function')ack({ok:false,message:'Not enough coins.'});return;}w.coins-=cost;w.owned[cat].push(id);}
+    w.equipped[cat]=id;saveWallets();const state=walletSnapshot(socket);socket.emit('wallet_update',state);
+    if(typeof ack==='function')ack({ok:true,wallet:state});
+  });
   socket.on('get_friend_state', () => emitFriendState(socket.playerName));
 
   socket.on('get_player_stats', ({name} = {}) => {
@@ -568,6 +606,8 @@ io.on('connection', (socket) => {
     if(socket.id!==room.p1) return;
     const x=Number(data.x), y=Number(data.y), vx=Number(data.vx), vy=Number(data.vy);
     if(![x,y,vx,vy].every(Number.isFinite)) return;
+    if(x < -20 || x > 1044 || y < -20 || y > 660 || Math.abs(vx)>40 || Math.abs(vy)>40) return;
+    room.lastPuckState={x,y,vx,vy,at:Date.now()};
     socket.to(data.room).volatile.emit('puck_update',{room:data.room,x,y,vx,vy});
   });
   socket.on('score_update', data => {
@@ -577,9 +617,11 @@ io.on('connection', (socket) => {
     if(socket.id !== room.p1) return;
     const scorerSide=data?.scorer;
     if(scorerSide!=='left' && scorerSide!=='right') return;
-    // FIX: ignore duplicate goal reports for the same crossing (lag / double emit).
-    const now=Date.now();
-    if(now-(room.lastGoalAt||0) < GOAL_COOLDOWN_MS) return;
+    // Check a fresh host puck snapshot before allowing a goal/reward.
+    const puck=room.lastPuckState;const now=Date.now();
+    if(!puck||now-puck.at>250||puck.y<260||puck.y>380)return;
+    const plausible=scorerSide==='right'?(puck.x>=0&&puck.x<70&&puck.vx< -0.1):(puck.x<=1024&&puck.x>954&&puck.vx>0.1);
+    if(!plausible||now-(room.lastGoalAt||0)<GOAL_COOLDOWN_MS)return;
     room.lastGoalAt=now;
     if(!room.scores) room.scores={left:0,right:0};
     // Accept exactly one goal at a time; ignore stale, duplicate, or fabricated score totals.
@@ -589,6 +631,7 @@ io.on('connection', (socket) => {
     if(scorer?.playerName){
       const k=key(scorer.playerName); const st=cleanStats(playerStats[k]);
       st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats(); recordGoal(scorer.playerName);
+      awardGoalCoins(scorer,5);
       scorer.emit('stats_updated',{name:scorer.playerName,stats:st});
     }
     io.to(data.room).emit('score_update', {room:data.room, scores:{...room.scores}, scorer:scorerSide});
