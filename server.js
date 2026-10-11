@@ -309,7 +309,7 @@ io.on('connection', (socket) => {
     // Match cosmetics are intentionally immutable snapshots captured by startMatch().
     // Do not broadcast later profile edits into an active match.
     emitFriendState(socket.playerName);
-    socket.emit('profile_accepted', {name:socket.playerName, profileId:socket.profileId});
+    socket.emit('profile_accepted', {name:socket.playerName, profileId:socket.profileId, avatar:socket.playerAvatar});
   });
 
   socket.on('get_friend_state', () => emitFriendState(socket.playerName));
