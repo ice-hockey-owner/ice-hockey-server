@@ -355,7 +355,10 @@ function acceptProfileForSocket(socket, data={}) {
   if(!reserved){ reservedNames[nk]=pid; saveReservedNames(); }
   socket.profileId=pid;
   if(oldName && key(oldName)!==nk && onlineByName.get(key(oldName))===socket.id) onlineByName.delete(key(oldName));
-  socket.playerName=name; socket.playerAvatar=sanitizeAvatar(data.avatar||socket.playerAvatar||'',data.avatarModerated===true); socket.playerCustomization=cleanCustomization(data.customization||socket.playerCustomization||{}); onlineByName.set(nk,socket.id); ensureUser(name);
+  socket.playerName=name; socket.playerAvatar=sanitizeAvatar(data.avatar||socket.playerAvatar||'',data.avatarModerated===true);
+  const authoritativeWallet=getWallet(socket);
+  socket.playerCustomization=cleanCustomization(authoritativeWallet?.equipped||data.customization||socket.playerCustomization||{});
+  onlineByName.set(nk,socket.id); ensureUser(name);
   return {ok:true};
 }
 
@@ -394,7 +397,7 @@ io.on('connection', (socket) => {
     const w=getWallet(socket);if(!w){if(typeof ack==='function')ack({ok:false,message:'Profile is not ready.'});return;}
     if(!Array.isArray(w.owned[cat]))w.owned[cat]=[];
     if(!w.owned[cat].includes(id)){const cost=costs[id];if(w.coins<cost){if(typeof ack==='function')ack({ok:false,message:'Not enough coins.'});return;}w.coins-=cost;w.owned[cat].push(id);}
-    w.equipped[cat]=id;saveWallets();const state=walletSnapshot(socket);socket.emit('wallet_update',state);
+    w.equipped[cat]=id;socket.playerCustomization=cleanCustomization(w.equipped);saveWallets();const state=walletSnapshot(socket);socket.emit('wallet_update',state);
     if(typeof ack==='function')ack({ok:true,wallet:state});
   });
   socket.on('get_friend_state', () => emitFriendState(socket.playerName));
