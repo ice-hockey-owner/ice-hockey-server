@@ -182,6 +182,40 @@ function startMatch(p1,p2,roomId){
 function normalizeName(name) {
   return String(name || '').trim().slice(0, 20);
 }
+// Central safety moderation for profile names and text chat. Override/add words with CENSORED_WORDS on Render.
+const BUILTIN_CENSORED_WORDS = [
+  'fuck','fucker','fucking','motherfucker','shit','bullshit','bitch','bitches',
+  'asshole','bastard','dickhead','dick','pussy','cunt','whore','slut',
+  'nigger','nigga','faggot','retard','chutiya','chutiye','madarchod',
+  'behenchod','bhenchod','bhosdike','bhosdi','gaand','gaanduu','gandu',
+  'harami','randi','lund','loda','lauda','chut','chodu','chodna'
+];
+function normalizeForModeration(value) {
+  return String(value || '').normalize('NFKC').toLowerCase()
+    .replace(/[0]/g,'o').replace(/[1!|]/g,'i').replace(/[3]/g,'e')
+    .replace(/[4@]/g,'a').replace(/[5$]/g,'s').replace(/[7]/g,'t')
+    .replace(/[^a-z0-9]+/g,' ').trim();
+}
+function containsCensoredText(value) {
+  const normalized = normalizeForModeration(value);
+  const tokens = new Set(normalized.split(/\s+/).filter(Boolean));
+  const compact = normalized.replace(/\s+/g,'');
+  const extra = String(process.env.CENSORED_WORDS || '').split(',').map(w=>normalizeForModeration(w).replace(/\s+/g,'')).filter(Boolean);
+  for (const raw of [...BUILTIN_CENSORED_WORDS, ...extra]) {
+    const word = normalizeForModeration(raw).replace(/\s+/g,'');
+    if (!word) continue;
+    if (tokens.has(word) || (word.length >= 5 && compact.includes(word))) return true;
+  }
+  return false;
+}
+const APPROVED_AVATAR = 'https://ice-hockey-server.onrender.com/random-id-photo';
+function sanitizeAvatar(value) {
+  const avatar = String(value || '').trim();
+  // Only server-hosted, pre-approved avatars are accepted; data URLs and arbitrary remote images are rejected.
+  if (/^https:\/\/ice-hockey-server\.onrender\.com\/random-id-photo(?:\?[^\s]*)?$/i.test(avatar) ||
+      /^\/random-id-photo(?:\?[^\s]*)?$/i.test(avatar)) return avatar;
+  return APPROVED_AVATAR + '?t=' + Date.now();
+}
 function key(name) { return normalizeName(name).toLowerCase(); }
 function ensureUser(name) {
   const k = key(name);
@@ -226,6 +260,7 @@ function emitFriendState(name) {
 function acceptProfileForSocket(socket, data={}) {
   const oldName=socket.playerName;
   const name=normalizeName(data.name)||socket.playerName||'Player';
+  if (containsCensoredText(name)) return {ok:false,message:'That name is not allowed. Please choose a different name.'};
   const pid=profileKey(data)||socket.profileId||('legacy_'+socket.id);
   const nk=key(name);
   const reserved=reservedNames[nk];
@@ -246,7 +281,7 @@ function acceptProfileForSocket(socket, data={}) {
   if(!reserved){ reservedNames[nk]=pid; saveReservedNames(); }
   socket.profileId=pid;
   if(oldName && key(oldName)!==nk && onlineByName.get(key(oldName))===socket.id) onlineByName.delete(key(oldName));
-  socket.playerName=name; socket.playerAvatar=data.avatar||socket.playerAvatar||''; socket.playerCustomization=cleanCustomization(data.customization||socket.playerCustomization||{}); onlineByName.set(nk,socket.id); ensureUser(name);
+  socket.playerName=name; socket.playerAvatar=sanitizeAvatar(data.avatar||socket.playerAvatar||''); socket.playerCustomization=cleanCustomization(data.customization||socket.playerCustomization||{}); onlineByName.set(nk,socket.id); ensureUser(name);
   return {ok:true};
 }
 
@@ -270,7 +305,7 @@ io.on('connection', (socket) => {
 
   socket.on('set_profile', (data = {}) => {
     const accepted = acceptProfileForSocket(socket, data);
-    if (!accepted.ok) return socket.emit('name_taken', {message:'Username already exists.'});
+    if (!accepted.ok) return socket.emit('name_taken', {message:accepted.message || 'Username already exists.'});
     // Match cosmetics are intentionally immutable snapshots captured by startMatch().
     // Do not broadcast later profile edits into an active match.
     emitFriendState(socket.playerName);
@@ -343,6 +378,11 @@ io.on('connection', (socket) => {
     const from = normalizeName(socket.playerName);
     const to = normalizeName(data.to);
     if (!from || !to) return;
+    const messageText = String(data.text || '').slice(0, 2000);
+    if (containsCensoredText(messageText)) return socket.emit('chat_error', { message: 'Message blocked by safety moderation. Please remove censored language.' });
+    // Media content cannot be reliably safety-checked without an image/audio moderation service,
+    // so attachments are blocked rather than allowing unreviewed explicit media through chat.
+    if (data.attachment) return socket.emit('chat_error', { message: 'Attachments are temporarily disabled by safety moderation. Please send text only.' });
     ensureUser(from); ensureUser(to);
     if (!friends.get(key(from)).has(to)) return;
     const targetId = onlineByName.get(key(to));
@@ -352,8 +392,8 @@ io.on('connection', (socket) => {
       id: `${Date.now()}_${Math.random().toString(36).slice(2)}`,
       from,
       to,
-      text: String(data.text || '').slice(0, 2000),
-      attachment: data.attachment || null,
+      text: messageText,
+      attachment: null,
       avatar: socket.playerAvatar || '',
       customization: socket.playerCustomization || cleanCustomization(),
       time: Date.now()
