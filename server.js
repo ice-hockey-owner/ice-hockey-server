@@ -6,7 +6,7 @@ const fs = require('fs');
 
 const app = express();
 // Every Express route needs CORS too, not just Socket.IO -- the client lives on a
-// different origin (Poki) and calls /api/leaderboard and /random-id-photo directly.
+// different origin and calls /api/leaderboard and /random-id-photo directly.
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -27,8 +27,12 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: "*" },
   maxHttpBufferSize: 8e6,
-  pingInterval: 25000,
-  pingTimeout: 60000
+  // A dead connection used to take up to 85s to be noticed, freezing the
+  // opponent's game. Detect it within ~25s instead.
+  pingInterval: 10000,
+  pingTimeout: 15000,
+  // Tiny realtime packets (positions) are not worth compressing; it only adds latency/CPU.
+  perMessageDeflate: false
 });
 
 app.use(express.static(__dirname));
@@ -57,13 +61,47 @@ const friends = new Map();        // name -> Set(friend names)
 const chatHistory = new Map();   // sorted pair -> recent messages
 const rematchChallenges = new Map(); // target name -> challenger name
 const MAX_FRIENDS = 250;
+const GOAL_COOLDOWN_MS = 1200; // ignore duplicate goal reports for the same puck crossing
 const dataDir = process.env.DATA_DIR || __dirname;
 try { fs.mkdirSync(dataDir, { recursive: true }); } catch {}
 const statsFile = path.join(dataDir, 'player-stats.json');
 const goalEventsFile = path.join(dataDir, 'goal-events.json');
+const namesFile = path.join(dataDir, 'reserved-names.json');
+const rewardFile = path.join(dataDir, 'rewarded-ads.json');
+
+// ---- Persistence --------------------------------------------------------
+// The old code called fs.writeFileSync (pretty-printed, up to 200k goal events)
+// on EVERY goal. That blocks the single Node event loop for every connected
+// player and shows up as sudden lag spikes. Saves are now debounced, async,
+// compact and atomic (temp file + rename), and flushed synchronously on shutdown.
+const savers = [];
+function makeSaver(file, getData) {
+  let dirty = false, writing = false, timer = null;
+  const flushAsync = () => {
+    timer = null;
+    if (!dirty || writing) { if (dirty && !timer) timer = setTimeout(flushAsync, 1000); return; }
+    dirty = false; writing = true;
+    const tmp = file + '.tmp';
+    fs.writeFile(tmp, JSON.stringify(getData()), err => {
+      if (err) { writing = false; dirty = true; return; }
+      fs.rename(tmp, file, () => { writing = false; if (dirty && !timer) timer = setTimeout(flushAsync, 3000); });
+    });
+  };
+  const saver = {
+    schedule() { dirty = true; if (!timer && !writing) timer = setTimeout(flushAsync, 3000); },
+    flushSync() { if (!dirty) return; dirty = false; try { fs.writeFileSync(file, JSON.stringify(getData())); } catch {} }
+  };
+  savers.push(saver);
+  return saver;
+}
+function flushAllSync() { for (const s of savers) s.flushSync(); }
+process.on('SIGTERM', () => { flushAllSync(); process.exit(0); });
+process.on('SIGINT', () => { flushAllSync(); process.exit(0); });
+
 let goalEvents = [];
 try { goalEvents = JSON.parse(fs.readFileSync(goalEventsFile, 'utf8')) || []; } catch { goalEvents = []; }
-function saveGoalEvents(){ try { fs.writeFileSync(goalEventsFile, JSON.stringify(goalEvents.slice(-200000), null, 2)); } catch {} }
+const goalEventsSaver = makeSaver(goalEventsFile, () => goalEvents.slice(-200000));
+function saveGoalEvents(){ goalEventsSaver.schedule(); }
 function recordGoal(name){
   const playerName = normalizeName(name);
   if(!playerName) return;
@@ -77,20 +115,21 @@ function leaderboardWindow(period){
   if(period === 'monthly') return new Date(now.getFullYear(), now.getMonth(), 1).getTime();
   return 0;
 }
-const namesFile = path.join(dataDir, 'reserved-names.json');
-const rewardFile = path.join(dataDir, 'rewarded-ads.json');
 let reservedNames = {};
 let rewardedAds = {};
 try { reservedNames = JSON.parse(fs.readFileSync(namesFile, 'utf8')) || {}; } catch { reservedNames = {}; }
 try { rewardedAds = JSON.parse(fs.readFileSync(rewardFile, 'utf8')) || {}; } catch { rewardedAds = {}; }
-function saveReservedNames(){ try { fs.writeFileSync(namesFile, JSON.stringify(reservedNames,null,2)); } catch {} }
-function saveRewardedAds(){ try { fs.writeFileSync(rewardFile, JSON.stringify(rewardedAds,null,2)); } catch {} }
+const namesSaver = makeSaver(namesFile, () => reservedNames);
+const rewardSaver = makeSaver(rewardFile, () => rewardedAds);
+function saveReservedNames(){ namesSaver.schedule(); }
+function saveRewardedAds(){ rewardSaver.schedule(); }
 function rewardDay(){ return new Intl.DateTimeFormat('en-CA',{timeZone:'Asia/Kolkata',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date()); }
 function profileKey(data){ return String(data?.profileId || '').trim().slice(0,80); }
 let playerStats = {};
 try { playerStats = JSON.parse(fs.readFileSync(statsFile, 'utf8')) || {}; } catch { playerStats = {}; }
+const statsSaver = makeSaver(statsFile, () => playerStats);
 function cleanStats(st){ const games=Number(st?.gamesPlayed)||0,wins=Number(st?.wins)||0,losses=Number(st?.losses)||0,goals=Number(st?.goals)||0; return {gamesPlayed:games,wins,losses,goals,winRate:games?Math.round(wins/games*100):0}; }
-function saveStats(){ try { fs.writeFileSync(statsFile, JSON.stringify(playerStats,null,2)); } catch {} }
+function saveStats(){ statsSaver.schedule(); }
 function getLeaderboardRows(period='all'){
   const normalized = String(period || 'all').toLowerCase();
   let rows;
@@ -121,14 +160,13 @@ function startMatch(p1,p2,roomId){
   const startAt=Date.now()+2100;
   const p1Profile={name:p1.playerName||'Player 1',avatar:p1.playerAvatar||'',customization:cleanCustomization(p1.playerCustomization||{})};
   const p2Profile={name:p2.playerName||'Player 2',avatar:p2.playerAvatar||'',customization:cleanCustomization(p2.playerCustomization||{})};
-  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,scores:{left:0,right:0},profiles:{left:p1Profile,right:p2Profile}};
+  rooms[roomId]={p1:p1.id,p2:p2.id,startAt,ended:false,lastGoalAt:0,scores:{left:0,right:0},profiles:{left:p1Profile,right:p2Profile}};
   p1.join(roomId); p2.join(roomId);
   // The room keeps an immutable snapshot for this match. Each client receives
   // BOTH players' profiles, so the renderer never has to guess whose cosmetic belongs where.
   const payload=(side,self,opp)=>({
     room:roomId,side,startAt,
     // Canonical match identities: left is always p1, right is always p2.
-    // Every client receives the same two immutable profiles.
     leftProfile:p1Profile,
     rightProfile:p2Profile,
     selfProfile:self,opponentProfile:opp,
@@ -162,13 +200,6 @@ function cleanCustomization(c={}) {
     font: CUSTOMIZATION_OPTIONS.font.has(c.font) ? c.font : 'font-ocean'
   };
 }
-function publicProfile(socket) {
-  return {
-    name: socket.playerName || 'Player',
-    avatar: socket.playerAvatar || '',
-    customization: socket.playerCustomization || cleanCustomization()
-  };
-}
 function emitFriendState(name) {
   const k = key(name);
   const socketId = onlineByName.get(k);
@@ -190,18 +221,28 @@ function emitFriendState(name) {
   s.emit('friend_state', { friends: list, requests });
 }
 
+// Single place that validates + applies a profile (used by set_profile, find_match,
+// create_room and join_room, which previously had two diverging copies).
 function acceptProfileForSocket(socket, data={}) {
   const oldName=socket.playerName;
   const name=normalizeName(data.name)||socket.playerName||'Player';
   const pid=profileKey(data)||socket.profileId||('legacy_'+socket.id);
   const nk=key(name);
   const reserved=reservedNames[nk];
-  const onlineOwner=onlineByName.get(nk);
   const ownsCurrentName = !!oldName && key(oldName) === nk;
-  // Entries in reserved-names.json are truly reserved, including legacy entries.
-  // Only the socket that already owns the current name may re-submit it. A fresh
-  // browser/device can never claim a reserved username.
-  if((reserved && !ownsCurrentName) || (onlineOwner && onlineOwner!==socket.id)) return {ok:false,message:'That username is already taken. Please choose another one.'};
+  // FIX: a reserved name must be usable by the profile that reserved it. Previously a
+  // page reload / reconnect (new socket, no playerName yet) was told its OWN username
+  // was taken. A different profileId still can never claim a reserved name.
+  const ownsReservation = !!reserved && reserved === pid;
+  if (reserved && !ownsCurrentName && !ownsReservation) return {ok:false,message:'That username is already taken. Please choose another one.'};
+  const onlineOwner=onlineByName.get(nk);
+  if (onlineOwner && onlineOwner!==socket.id) {
+    const stale = io.sockets.sockets.get(onlineOwner);
+    // Same profile reconnecting while its old (dead/half-open) socket is still
+    // registered: drop the stale socket instead of locking the player out.
+    if (stale && stale.profileId === pid) { stale.disconnect(true); }
+    else if (stale) return {ok:false,message:'That username is already taken. Please choose another one.'};
+  }
   if(!reserved){ reservedNames[nk]=pid; saveReservedNames(); }
   socket.profileId=pid;
   if(oldName && key(oldName)!==nk && onlineByName.get(key(oldName))===socket.id) onlineByName.delete(key(oldName));
@@ -209,35 +250,31 @@ function acceptProfileForSocket(socket, data={}) {
   return {ok:true};
 }
 
+function inActiveRoom(socket) {
+  for (const id in rooms) {
+    const r = rooms[id];
+    if (!r.ended && r.p2 && (r.p1 === socket.id || r.p2 === socket.id)) return true;
+  }
+  return false;
+}
+// Remove any not-yet-started room this socket created (so abandoned codes don't pile up).
+function dropOwnPendingRooms(socket) {
+  for (const id in rooms) {
+    const r = rooms[id];
+    if (r.p1 === socket.id && !r.p2) { delete rooms[id]; socket.leave(id); }
+  }
+}
+
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
 
   socket.on('set_profile', (data = {}) => {
-    const oldName = socket.playerName;
-    const name = normalizeName(data.name) || 'Player';
-    const pid = profileKey(data) || socket.profileId || ('legacy_' + socket.id);
-    const nk = key(name);
-    const reserved = reservedNames[nk];
-    const onlineOwner = onlineByName.get(nk);
-    const ownsCurrentName = !!socket.playerName && key(socket.playerName) === nk;
-    // Reserved names are rejected on a new socket. The current socket can keep
-    // re-submitting its already accepted name.
-    if (reserved && !ownsCurrentName) {
-      return socket.emit('name_taken', {message:'Username already exists.'});
-    }
-    if (onlineOwner && onlineOwner !== socket.id) return socket.emit('name_taken', {message:'Username already exists.'});
-    if (!reserved) { reservedNames[nk]=pid; saveReservedNames(); }
-    socket.profileId = pid;
-    if (oldName && key(oldName) !== nk && onlineByName.get(key(oldName)) === socket.id) onlineByName.delete(key(oldName));
-    socket.playerName = name;
-    socket.playerAvatar = data.avatar || '';
-    socket.playerCustomization = cleanCustomization(data.customization || {});
-    onlineByName.set(nk, socket.id);
+    const accepted = acceptProfileForSocket(socket, data);
+    if (!accepted.ok) return socket.emit('name_taken', {message:'Username already exists.'});
     // Match cosmetics are intentionally immutable snapshots captured by startMatch().
     // Do not broadcast later profile edits into an active match.
-    ensureUser(name);
-    emitFriendState(name);
-    socket.emit('profile_accepted', {name, profileId:pid});
+    emitFriendState(socket.playerName);
+    socket.emit('profile_accepted', {name:socket.playerName, profileId:socket.profileId});
   });
 
   socket.on('get_friend_state', () => emitFriendState(socket.playerName));
@@ -373,11 +410,15 @@ io.on('connection', (socket) => {
       const accepted=acceptProfileForSocket(socket,data.profile);
       if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message});
     }
+    if (inActiveRoom(socket)) return;
+    // FIX: never pair with a waiting player whose connection has already dropped.
+    if (waitingPlayer && !waitingPlayer.connected) waitingPlayer = null;
     if (waitingPlayer && waitingPlayer.id !== socket.id) {
       const roomId = 'room_' + socket.id + '_' + waitingPlayer.id;
       const p1 = waitingPlayer, p2 = socket;
-      startMatch(p1,p2,roomId);
       waitingPlayer = null;
+      dropOwnPendingRooms(p1); dropOwnPendingRooms(p2);
+      startMatch(p1,p2,roomId);
     } else {
       waitingPlayer = socket;
       socket.emit('waiting');
@@ -388,31 +429,58 @@ io.on('connection', (socket) => {
 
   socket.on('create_room', (data = {}) => {
     if (data.profile && typeof data.profile === 'object') { const accepted=acceptProfileForSocket(socket,data.profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
-    const code = Math.random().toString(36).substring(2, 8).toUpperCase();
+    if (inActiveRoom(socket)) return;
+    if (waitingPlayer === socket) waitingPlayer = null;
+    dropOwnPendingRooms(socket); // FIX: previous unused room codes were leaked
+    let code;
+    do { code = Math.random().toString(36).substring(2, 8).toUpperCase(); } while (!code || rooms[code]);
     socket.join(code);
-    rooms[code] = { p1: socket.id, p2: null, startAt: null, ended: false, scores: { left: 0, right: 0 } };
+    rooms[code] = { p1: socket.id, p2: null, startAt: null, ended: false, lastGoalAt: 0, scores: { left: 0, right: 0 } };
     socket.emit('room_created', { code });
   });
 
   socket.on('join_room', ({ code, profile } = {}) => {
     if (profile && typeof profile === 'object') { const accepted=acceptProfileForSocket(socket,profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
-    const room = rooms[code];
-    if (room && !room.p2) {
-      room.p2 = socket.id;
-      const p1Socket = io.sockets.sockets.get(room.p1);
-      if(p1Socket) startMatch(p1Socket,socket,code);
-    } else socket.emit('join_error', { message: 'Room not found or game already full!' });
+    const roomCode = String(code || '').trim().toUpperCase();
+    const room = rooms[roomCode];
+    const err = () => socket.emit('join_error', { message: 'Room not found or game already full!' });
+    if (!room || room.p2 || room.ended) return err();
+    // FIX: could join your own room, and used to mark the room full even when the host was gone.
+    if (room.p1 === socket.id) return socket.emit('join_error', { message: 'You cannot join your own room.' });
+    const p1Socket = io.sockets.sockets.get(room.p1);
+    if (!p1Socket || !p1Socket.connected) { delete rooms[roomCode]; return err(); }
+    if (waitingPlayer === socket) waitingPlayer = null;
+    startMatch(p1Socket, socket, roomCode);
   });
 
-  socket.on('player_move', data => { const room=rooms[data?.room]; if(!room) return; if(socket.id!==room.p1 && socket.id!==room.p2) return; const x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return; socket.to(data.room).emit('opponent_move',{x,y}); });
-  socket.on('puck_update', data => socket.to(data.room).emit('puck_update', data));
+  // --- Realtime packets: volatile (dropped, not queued, when the link is congested)
+  // and only accepted from the correct player.
+  socket.on('player_move', data => {
+    const room=rooms[data?.room]; if(!room||room.ended) return;
+    if(socket.id!==room.p1 && socket.id!==room.p2) return;
+    const x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return;
+    socket.to(data.room).volatile.emit('opponent_move',{x,y});
+  });
+  socket.on('puck_update', data => {
+    const room=rooms[data?.room]; if(!room||room.ended) return;
+    // FIX: only the puck authority (left / p1) may broadcast puck state. Previously any
+    // client in the room could overwrite the puck for everybody.
+    if(socket.id!==room.p1) return;
+    const x=Number(data.x), y=Number(data.y), vx=Number(data.vx), vy=Number(data.vy);
+    if(![x,y,vx,vy].every(Number.isFinite)) return;
+    socket.to(data.room).volatile.emit('puck_update',{room:data.room,x,y,vx,vy});
+  });
   socket.on('score_update', data => {
-    const room=rooms[data?.room]; if(!room || room.ended) return;
+    const room=rooms[data?.room]; if(!room || room.ended || !room.p2) return;
     // Only the left-side client simulates puck physics and may report a goal.
     // This avoids both clients incrementing the score for the same puck crossing.
     if(socket.id !== room.p1) return;
     const scorerSide=data?.scorer;
     if(scorerSide!=='left' && scorerSide!=='right') return;
+    // FIX: ignore duplicate goal reports for the same crossing (lag / double emit).
+    const now=Date.now();
+    if(now-(room.lastGoalAt||0) < GOAL_COOLDOWN_MS) return;
+    room.lastGoalAt=now;
     if(!room.scores) room.scores={left:0,right:0};
     // Accept exactly one goal at a time; ignore stale, duplicate, or fabricated score totals.
     room.scores[scorerSide] += 1;
@@ -423,7 +491,7 @@ io.on('connection', (socket) => {
       st.goals++; st.name=scorer.playerName; playerStats[k]=st; saveStats(); recordGoal(scorer.playerName);
       scorer.emit('stats_updated',{name:scorer.playerName,stats:st});
     }
-    io.to(data.room).emit('score_update', {...data, scores:{...room.scores}, scorer:scorerSide});
+    io.to(data.room).emit('score_update', {room:data.room, scores:{...room.scores}, scorer:scorerSide});
   });
 
   socket.on('rewarded_ad_status', () => {
@@ -447,10 +515,17 @@ io.on('connection', (socket) => {
     if (socket.playerName && onlineByName.get(key(socket.playerName)) === socket.id) {
       onlineByName.delete(key(socket.playerName));
       emitFriendState(socket.playerName);
+      // Drop rematch challenges involving this player so they can't be accepted later.
+      const nk = key(socket.playerName);
+      rematchChallenges.delete(nk);
+      for (const [target, challenger] of rematchChallenges) if (key(challenger) === nk) rematchChallenges.delete(target);
     }
     for (const roomId in rooms) {
-      if (rooms[roomId].p1 === socket.id || rooms[roomId].p2 === socket.id) {
-        io.to(roomId).emit('opponent_disconnected');
+      const r = rooms[roomId];
+      if (r.p1 === socket.id || r.p2 === socket.id) {
+        // FIX: only tell the opponent when the match was actually still running. Sending it
+        // after the match ended made the client alert + reload on the game-over screen.
+        if (!r.ended && r.p2) io.to(roomId).emit('opponent_disconnected');
         delete rooms[roomId];
       }
     }
@@ -460,12 +535,9 @@ io.on('connection', (socket) => {
 
 const PORT = process.env.PORT || 3000;
 
-// IMPORTANT (Vercel): a Vercel Function needs the http.Server handed back via
-// module.exports so it can drive both plain HTTP requests *and* WebSocket
-// upgrade requests through it. Calling server.listen(PORT) targets a real
-// TCP port, which doesn't mean anything inside a Vercel Function -- so we
-// only listen when actually running as a normal long-lived Node process
-// (local dev, or any non-Vercel host such as Render/Railway/Fly/a VPS).
+// A Vercel Function needs the http.Server handed back via module.exports, but Vercel
+// cannot host persistent WebSockets or shared in-memory state. This server is meant to
+// run as a normal long-lived Node process (Render/Railway/Fly/VPS).
 if (!process.env.VERCEL) {
   server.listen(PORT, () => console.log(`Ice Hockey server running on ${PORT}`));
 }
