@@ -208,7 +208,7 @@ function containsCensoredText(value) {
   }
   return false;
 }
-const VIOLENT_TERMS = ['murder','murderer','kill yourself','kill them','i will kill','i will hurt','rape','rapist','stab','stabbing','behead','decapitate','massacre','bloodbath','gore','dismember','torture','terrorist','terrorism','school shooting','shooting victims','graphic violence','suicide bomb','human trafficking','child abuse'];
+const VIOLENT_TERMS = ['murder','murderer','kill yourself','kill them','i will kill','i will hurt','kill','killing','rape','rapist','stab','stabbing','behead','decapitate','massacre','bloodbath','gore','dismember','torture','terrorist','terrorism','gun','guns','weapon','weapons','knife','knives','bomb','bombing','corpse','dead body','school shooting','shooting victims','graphic violence','suicide bomb','human trafficking','child abuse'];
 function containsViolentText(value) {
   const normalized = ' ' + normalizeForModeration(value) + ' ';
   return VIOLENT_TERMS.some(term => normalized.includes(' ' + normalizeForModeration(term) + ' '));
