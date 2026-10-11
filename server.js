@@ -208,13 +208,52 @@ function containsCensoredText(value) {
   }
   return false;
 }
+const VIOLENT_TERMS = ['murder','murderer','kill yourself','kill them','i will kill','i will hurt','rape','rapist','stab','stabbing','behead','decapitate','massacre','bloodbath','gore','dismember','torture','terrorist','terrorism','school shooting','shooting victims','graphic violence','suicide bomb','human trafficking','child abuse'];
+function containsViolentText(value) {
+  const normalized = ' ' + normalizeForModeration(value) + ' ';
+  return VIOLENT_TERMS.some(term => normalized.includes(' ' + normalizeForModeration(term) + ' '));
+}
+async function moderateWithOpenAI(input) {
+  if (!process.env.OPENAI_API_KEY) return {available:false, flagged:false};
+  const response = await fetch('https://api.openai.com/v1/moderations', {
+    method:'POST', headers:{'Authorization':'Bearer '+process.env.OPENAI_API_KEY,'Content-Type':'application/json'},
+    body:JSON.stringify({model:'omni-moderation-latest',input})
+  });
+  if (!response.ok) throw new Error('Moderation provider returned HTTP '+response.status);
+  const body = await response.json();
+  const results = Array.isArray(body.results) ? body.results : [];
+  const blockedCategories = ['violence','violence/graphic','sexual','sexual/minors','hate','hate/threatening','harassment/threatening','self-harm','self-harm/intent','self-harm/instructions'];
+  return {available:true,flagged:results.some(result=>blockedCategories.some(category=>result.categories?.[category]===true))};
+}
+async function moderateImageDataUrl(value) {
+  const dataUrl=String(value||'');
+  if (!/^data:image\/(png|jpeg|jpg|webp|gif);base64,[a-z0-9+/=\r\n]+$/i.test(dataUrl)) return {available:true,flagged:true};
+  if (dataUrl.length > 4_300_000) return {available:true,flagged:true};
+  return moderateWithOpenAI([{type:'image_url',image_url:{url:dataUrl}}]);
+}
 const APPROVED_AVATAR = 'https://ice-hockey-server.onrender.com/random-id-photo';
-function sanitizeAvatar(value) {
+function sanitizeAvatar(value, moderationPassed=false) {
   const avatar = String(value || '').trim();
-  // Only server-hosted, pre-approved avatars are accepted; data URLs and arbitrary remote images are rejected.
+  if (moderationPassed && /^data:image\/(png|jpeg|jpg|webp);base64,[a-z0-9+/=\r\n]+$/i.test(avatar) && avatar.length<=1_500_000) return avatar;
   if (/^https:\/\/ice-hockey-server\.onrender\.com\/random-id-photo(?:\?[^\s]*)?$/i.test(avatar) ||
       /^\/random-id-photo(?:\?[^\s]*)?$/i.test(avatar)) return avatar;
   return APPROVED_AVATAR + '?t=' + Date.now();
+}
+async function acceptModeratedProfile(socket, data={}) {
+  const profile = {...data};
+  const avatar = String(profile.avatar || '');
+  let avatarModerated=false;
+  if (avatar.startsWith('data:image/')) {
+    if (avatar === socket.playerAvatar) avatarModerated=true;
+    else {
+      const result=await moderateImageDataUrl(avatar);
+      if (!result.available) return {ok:false,message:'Image moderation is not configured on the game server yet. Please try an approved avatar later.'};
+      if (result.flagged) return {ok:false,message:'That avatar was blocked by safety moderation. Please choose a different image.'};
+      avatarModerated=true;
+    }
+  }
+  profile.avatarModerated=avatarModerated;
+  return acceptProfileForSocket(socket,profile);
 }
 function key(name) { return normalizeName(name).toLowerCase(); }
 function ensureUser(name) {
@@ -281,7 +320,7 @@ function acceptProfileForSocket(socket, data={}) {
   if(!reserved){ reservedNames[nk]=pid; saveReservedNames(); }
   socket.profileId=pid;
   if(oldName && key(oldName)!==nk && onlineByName.get(key(oldName))===socket.id) onlineByName.delete(key(oldName));
-  socket.playerName=name; socket.playerAvatar=sanitizeAvatar(data.avatar||socket.playerAvatar||''); socket.playerCustomization=cleanCustomization(data.customization||socket.playerCustomization||{}); onlineByName.set(nk,socket.id); ensureUser(name);
+  socket.playerName=name; socket.playerAvatar=sanitizeAvatar(data.avatar||socket.playerAvatar||'',data.avatarModerated===true); socket.playerCustomization=cleanCustomization(data.customization||socket.playerCustomization||{}); onlineByName.set(nk,socket.id); ensureUser(name);
   return {ok:true};
 }
 
@@ -303,8 +342,8 @@ function dropOwnPendingRooms(socket) {
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
 
-  socket.on('set_profile', (data = {}) => {
-    const accepted = acceptProfileForSocket(socket, data);
+  socket.on('set_profile', async (data = {}) => {
+    const accepted = await acceptModeratedProfile(socket, data);
     if (!accepted.ok) return socket.emit('name_taken', {message:accepted.message || 'Username already exists.'});
     // Match cosmetics are intentionally immutable snapshots captured by startMatch().
     // Do not broadcast later profile edits into an active match.
@@ -374,15 +413,28 @@ io.on('connection', (socket) => {
     emitFriendState(me);
   });
 
-  socket.on('chat_message', (data = {}) => {
+  socket.on('chat_message', async (data = {}) => {
     const from = normalizeName(socket.playerName);
     const to = normalizeName(data.to);
     if (!from || !to) return;
     const messageText = String(data.text || '').slice(0, 2000);
-    if (containsCensoredText(messageText)) return socket.emit('chat_error', { message: 'Message blocked by safety moderation. Please remove censored language.' });
-    // Media content cannot be reliably safety-checked without an image/audio moderation service,
-    // so attachments are blocked rather than allowing unreviewed explicit media through chat.
-    if (data.attachment) return socket.emit('chat_error', { message: 'Attachments are temporarily disabled by safety moderation. Please send text only.' });
+    if (containsCensoredText(messageText) || containsViolentText(messageText)) return socket.emit('chat_error', { message: 'Message blocked by safety moderation. Please remove censored or violent content.' });
+    if (messageText && process.env.OPENAI_API_KEY) {
+      try { const checked=await moderateWithOpenAI(messageText); if(checked.flagged) return socket.emit('chat_error',{message:'Message blocked by safety moderation. Please send a safe message.'}); }
+      catch(error) { console.error('Text moderation failed:',error.message); return socket.emit('chat_error',{message:'Safety moderation is temporarily unavailable. Please try again.'}); }
+    }
+    let safeAttachment=null;
+    if (data.attachment) {
+      const attachment=data.attachment;
+      if (!String(attachment.type||'').startsWith('image/')) return socket.emit('chat_error',{message:'Only images are supported by safety moderation; video and audio attachments are not supported yet.'});
+      if (String(attachment.data||'').length>4_300_000) return socket.emit('chat_error',{message:'Image is too large. Please use an image under 3 MB.'});
+      try {
+        const checked=await moderateImageDataUrl(attachment.data);
+        if(!checked.available) return socket.emit('chat_error',{message:'Image moderation is not configured on the game server yet. The admin must add OPENAI_API_KEY to Render before images can be sent.'});
+        if(checked.flagged) return socket.emit('chat_error',{message:'Image blocked by safety moderation. Please choose a non-violent, non-explicit image.'});
+        safeAttachment={name:String(attachment.name||'image').slice(0,100),type:String(attachment.type),data:String(attachment.data)};
+      } catch(error) { console.error('Image moderation failed:',error.message); return socket.emit('chat_error',{message:'Image safety check failed. Please try again later.'}); }
+    }
     ensureUser(from); ensureUser(to);
     if (!friends.get(key(from)).has(to)) return;
     const targetId = onlineByName.get(key(to));
@@ -393,7 +445,7 @@ io.on('connection', (socket) => {
       from,
       to,
       text: messageText,
-      attachment: null,
+      attachment: safeAttachment,
       avatar: socket.playerAvatar || '',
       customization: socket.playerCustomization || cleanCustomization(),
       time: Date.now()
@@ -443,11 +495,11 @@ io.on('connection', (socket) => {
   });
 
   // Quick Match
-  socket.on('find_match', (data = {}) => {
+  socket.on('find_match', async (data = {}) => {
     // Refresh the matchmaking profile atomically with the request so each
     // side's equipped cosmetics are the exact ones captured for this match.
     if (data.profile && typeof data.profile === 'object') {
-      const accepted=acceptProfileForSocket(socket,data.profile);
+      const accepted=await acceptModeratedProfile(socket,data.profile);
       if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message});
     }
     if (inActiveRoom(socket)) return;
@@ -467,8 +519,8 @@ io.on('connection', (socket) => {
 
   socket.on('cancel_match', () => { if (waitingPlayer === socket) waitingPlayer = null; });
 
-  socket.on('create_room', (data = {}) => {
-    if (data.profile && typeof data.profile === 'object') { const accepted=acceptProfileForSocket(socket,data.profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
+  socket.on('create_room', async (data = {}) => {
+    if (data.profile && typeof data.profile === 'object') { const accepted=await acceptModeratedProfile(socket,data.profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
     if (inActiveRoom(socket)) return;
     if (waitingPlayer === socket) waitingPlayer = null;
     dropOwnPendingRooms(socket); // FIX: previous unused room codes were leaked
@@ -479,8 +531,8 @@ io.on('connection', (socket) => {
     socket.emit('room_created', { code });
   });
 
-  socket.on('join_room', ({ code, profile } = {}) => {
-    if (profile && typeof profile === 'object') { const accepted=acceptProfileForSocket(socket,profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
+  socket.on('join_room', async ({ code, profile } = {}) => {
+    if (profile && typeof profile === 'object') { const accepted=await acceptModeratedProfile(socket,profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
     const roomCode = String(code || '').trim().toUpperCase();
     const room = rooms[roomCode];
     const err = () => socket.emit('join_error', { message: 'Room not found or game already full!' });
