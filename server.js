@@ -241,6 +241,12 @@ function sanitizeAvatar(value, moderationPassed=false) {
 }
 async function acceptModeratedProfile(socket, data={}) {
   const profile = {...data};
+  const proposedName=normalizeName(profile.name)||socket.playerName||'Player';
+  if (containsViolentText(proposedName)) return {ok:false,message:'That name was blocked by safety moderation. Please choose a non-violent name.'};
+  if (process.env.OPENAI_API_KEY && key(proposedName)!==key(socket.playerName||'')) {
+    try { const nameCheck=await moderateWithOpenAI(proposedName); if(nameCheck.flagged) return {ok:false,message:'That name was blocked by safety moderation. Please choose a safe name.'}; }
+    catch(error) { console.error('Name moderation failed:',error.message); return {ok:false,message:'Name safety moderation is temporarily unavailable. Please try again.'}; }
+  }
   const avatar = String(profile.avatar || '');
   let avatarModerated=false;
   if (avatar.startsWith('data:image/')) {
@@ -264,13 +270,15 @@ function ensureUser(name) {
 const CUSTOMIZATION_OPTIONS = {
   frame: new Set(['frame-classic','frame-ice','frame-ruby','frame-gold','frame-neon','frame-aurora','frame-frost','frame-cosmic']),
   player: new Set(['player-blue','player-red','player-violet','player-mint','player-gold']),
-  font: new Set(['font-ocean','font-royal','font-tropical','font-sunset','font-aqua','font-aurora','font-candy','font-icefire'])
+  font: new Set(['font-ocean','font-royal','font-tropical','font-sunset','font-aqua','font-aurora','font-candy','font-icefire']),
+  trail: new Set(['trail-blue','trail-purple','trail-aurora','trail-fire','trail-gold'])
 };
 function cleanCustomization(c={}) {
   return {
     frame: CUSTOMIZATION_OPTIONS.frame.has(c.frame) ? c.frame : 'frame-classic',
     player: CUSTOMIZATION_OPTIONS.player.has(c.player) ? c.player : 'player-blue',
-    font: CUSTOMIZATION_OPTIONS.font.has(c.font) ? c.font : 'font-ocean'
+    font: CUSTOMIZATION_OPTIONS.font.has(c.font) ? c.font : 'font-ocean',
+    trail: CUSTOMIZATION_OPTIONS.trail.has(c.trail) ? c.trail : 'trail-blue'
   };
 }
 function emitFriendState(name) {
@@ -299,7 +307,7 @@ function emitFriendState(name) {
 function acceptProfileForSocket(socket, data={}) {
   const oldName=socket.playerName;
   const name=normalizeName(data.name)||socket.playerName||'Player';
-  if (containsCensoredText(name)) return {ok:false,message:'That name is not allowed. Please choose a different name.'};
+  if (containsCensoredText(name) || containsViolentText(name)) return {ok:false,message:'That name is not allowed by safety moderation. Please choose a different name.'};
   const pid=profileKey(data)||socket.profileId||('legacy_'+socket.id);
   const nk=key(name);
   const reserved=reservedNames[nk];
