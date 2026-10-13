@@ -648,12 +648,21 @@ io.on('connection', (socket) => {
   });
 
   socket.on('claim_rewarded_ad', (data={},ack) => {
-    const name=normalizeName(socket.playerName); if(!name){ if(typeof ack==='function')ack({granted:false,remaining:0,message:'Profile not ready.'}); return; }
+    const name=normalizeName(socket.playerName);
+    if(!name){ if(typeof ack==='function')ack({granted:false,remaining:0,message:'Profile not ready.'}); return; }
+    const w=getWallet(socket);
+    if(!w){ if(typeof ack==='function')ack({granted:false,remaining:0,message:'Wallet is not ready.'}); return; }
     const day=rewardDay(); const k=key(name); const entry=rewardedAds[k];
     const count=entry?.day===day ? Number(entry.count)||0 : 0;
     if(count>=2){ if(typeof ack==='function')ack({granted:false,remaining:0,message:'Daily limit reached. You can watch 2 rewarded ads per day.'}); return; }
-    rewardedAds[k]={day,count:count+1,profileId:socket.profileId||''}; saveRewardedAds();
-    if(typeof ack==='function')ack({granted:true,remaining:1-count});
+    // Only called by the client after Y8 reports that the rewarded ad was viewed.
+    // Server-side daily limit and wallet balance are updated together.
+    w.coins=Math.min(100000000,Math.max(0,Math.floor(Number(w.coins)||0))+50);
+    rewardedAds[k]={day,count:count+1,profileId:socket.profileId||''};
+    saveRewardedAds(); saveWallets();
+    const wallet=walletSnapshot(socket);
+    socket.emit('wallet_update',wallet);
+    if(typeof ack==='function')ack({granted:true,wallet,remaining:Math.max(0,1-count)});
   });
 
   socket.on('disconnect', () => {
