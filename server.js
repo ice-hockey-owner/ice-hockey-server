@@ -405,7 +405,17 @@ io.on('connection', (socket) => {
   });
 
   socket.on('player_move', data => { const room=rooms[data?.room]; if(!room) return; if(socket.id!==room.p1 && socket.id!==room.p2) return; const x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return; socket.to(data.room).emit('opponent_move',{x,y}); });
-  socket.on('puck_update', data => socket.to(data.room).emit('puck_update', data));
+  socket.on('puck_update', data => {
+    const room = rooms[data?.room];
+    if (!room || room.ended) return;
+    // The left-side client is the sole puck-physics authority. Reject guest-side
+    // snapshots so packet races cannot make the two clients simulate different pucks.
+    if (socket.id !== room.p1) return;
+    const x = Number(data.x), y = Number(data.y), vx = Number(data.vx), vy = Number(data.vy);
+    if (![x, y, vx, vy].every(Number.isFinite)) return;
+    if (x < -80 || x > 1104 || y < -80 || y > 720 || Math.abs(vx) > 45 || Math.abs(vy) > 45) return;
+    socket.to(data.room).emit('puck_update', { room: data.room, x, y, vx, vy, serverTime: Date.now() });
+  });
   socket.on('score_update', data => {
     const room=rooms[data?.room]; if(!room || room.ended) return;
     // Only the left-side client simulates puck physics and may report a goal.
