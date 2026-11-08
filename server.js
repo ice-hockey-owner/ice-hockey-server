@@ -441,6 +441,35 @@ function dropOwnPendingRooms(socket) {
   }
 }
 
+const RESIGN_WIN_COINS = 50;
+// A player leaving a running match (menu button, closed tab, dropped connection) resigns it:
+// leaver = +1 game +1 loss, remaining player = +1 game +1 win +coins, match ends immediately for both.
+function resolveResign(roomId, leaverId){
+  const r = rooms[roomId];
+  if (!r || r.ended || !r.p2) return false;
+  r.ended = true;
+  const stayerId = r.p1 === leaverId ? r.p2 : r.p1;
+  const leaver = io.sockets.sockets.get(leaverId), stayer = io.sockets.sockets.get(stayerId);
+  const counted = !!r.startAt && Date.now() >= r.startAt;   // leaving during the 3-2-1 countdown is not counted
+  let coins = 0;
+  const bump = (sock, win) => {
+    if (!sock?.playerName) return;
+    const k = key(sock.playerName), st = cleanStats(playerStats[k]);
+    st.gamesPlayed++; if (win) st.wins++; else st.losses++;
+    st.winRate = st.gamesPlayed ? Math.round(st.wins / st.gamesPlayed * 100) : 0;
+    st.name = sock.playerName; playerStats[k] = st; saveStats();
+    sock.emit('stats_updated', { name: sock.playerName, stats: st });
+  };
+  if (counted) {
+    bump(leaver, false);
+    bump(stayer, true);
+    if (stayer?.playerName) { awardGoalCoins(stayer, RESIGN_WIN_COINS); coins = RESIGN_WIN_COINS; }
+  }
+  stayer?.emit('opponent_resigned', { room: roomId, counted, coins, scores: { ...(r.scores || {}) } });
+  setTimeout(() => { if (rooms[roomId] === r) { delete rooms[roomId]; io.in(roomId).socketsLeave(roomId); } }, 5000);
+  return true;
+}
+
 io.on('connection', (socket) => {
   console.log('Player connected:', socket.id);
 
@@ -638,6 +667,10 @@ io.on('connection', (socket) => {
   });
 
   socket.on('cancel_match', () => { if (waitingPlayer === socket) waitingPlayer = null; });
+  // Explicit "leave match" (e.g. Main Menu from the settings panel) = resign.
+  socket.on('leave_match', () => {
+    for (const roomId in rooms) { const r = rooms[roomId]; if (r.p1 === socket.id || r.p2 === socket.id) resolveResign(roomId, socket.id); }
+  });
 
   socket.on('create_room', async (data = {}) => {
     if (data.profile && typeof data.profile === 'object') { const accepted=await acceptModeratedProfile(socket,data.profile); if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message}); }
@@ -742,7 +775,7 @@ io.on('connection', (socket) => {
     const day=rewardDay(); const k=key(name); const entry=rewardedAds[k];
     const count=entry?.day===day ? Number(entry.count)||0 : 0;
     if(count>=2){ if(typeof ack==='function')ack({granted:false,remaining:0,message:'Daily limit reached. You can watch 2 rewarded ads per day.'}); return; }
-    // Only called by the client after Y8 reports that the rewarded ad was viewed.
+    // Only called by the client after the platform SDK (Poki) reports that the rewarded ad was completed.
     // Server-side daily limit and wallet balance are updated together.
     w.coins=Math.min(100000000,Math.max(0,Math.floor(Number(w.coins)||0))+50);
     rewardedAds[k]={day,count:count+1,profileId:socket.profileId||''};
@@ -767,7 +800,7 @@ io.on('connection', (socket) => {
       if (r.p1 === socket.id || r.p2 === socket.id) {
         // FIX: only tell the opponent when the match was actually still running. Sending it
         // after the match ended made the client alert + reload on the game-over screen.
-        if (!r.ended && r.p2) io.to(roomId).emit('opponent_disconnected');
+        if (!r.ended && r.p2) { resolveResign(roomId, socket.id); continue; }
         delete rooms[roomId];
       }
     }
