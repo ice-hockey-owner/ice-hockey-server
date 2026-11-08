@@ -4,7 +4,11 @@ const { Server } = require('socket.io');
 const path = require('path');
 const fs = require('fs');
 
+process.on('uncaughtException', err => console.error('uncaughtException:', err && err.stack || err));
+process.on('unhandledRejection', err => console.error('unhandledRejection:', err && err.stack || err));
+
 const app = express();
+app.disable('x-powered-by');
 // Every Express route needs CORS too, not just Socket.IO -- the client lives on a
 // different origin and calls /api/leaderboard and /random-id-photo directly.
 app.use((req, res, next) => {
@@ -32,10 +36,14 @@ const io = new Server(server, {
   pingInterval: 10000,
   pingTimeout: 15000,
   // Tiny realtime packets (positions) are not worth compressing; it only adds latency/CPU.
-  perMessageDeflate: false
+  perMessageDeflate: false,
+  httpCompression: false,
+  transports: ['websocket', 'polling']
 });
 
-app.use(express.static(__dirname));
+// SECURITY: only /assets is public. Serving __dirname exposed server.js and the JSON data files
+// (reserved-names.json maps usernames to profile IDs, which act as account credentials).
+app.use('/assets', express.static(path.join(__dirname, 'assets'), { maxAge: '7d' }));
 app.get('/api/leaderboard', (req,res) => {
   res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
   res.json(getLeaderboardRows(req.query.period));
@@ -99,16 +107,38 @@ function flushAllSync() { for (const s of savers) s.flushSync(); }
 process.on('SIGTERM', () => { flushAllSync(); process.exit(0); });
 process.on('SIGINT', () => { flushAllSync(); process.exit(0); });
 
+// Goal history is an append-only log (one tiny async append per goal). The old design re-serialised up to
+// 200k events with JSON.stringify on the main thread every few seconds = a lag spike for every room.
+const goalLogFile = path.join(dataDir, 'goal-events.log');
+const MAX_GOAL_EVENTS = 200000;
 let goalEvents = [];
-try { goalEvents = JSON.parse(fs.readFileSync(goalEventsFile, 'utf8')) || []; } catch { goalEvents = []; }
-const goalEventsSaver = makeSaver(goalEventsFile, () => goalEvents.slice(-200000));
-function saveGoalEvents(){ goalEventsSaver.schedule(); }
+(function loadGoalEvents(){
+  let migrated = false, lines = 0;
+  try { const old = JSON.parse(fs.readFileSync(goalEventsFile, 'utf8')); if (Array.isArray(old)) { goalEvents = old.filter(e => e && e.name); migrated = true; } } catch {}
+  try {
+    for (const line of fs.readFileSync(goalLogFile, 'utf8').split('\n')) {
+      if (!line) continue; lines++;
+      try { const [n, a] = JSON.parse(line); if (n) goalEvents.push({ name: n, at: Number(a) || 0 }); } catch {}
+    }
+  } catch {}
+  if (goalEvents.length > MAX_GOAL_EVENTS) goalEvents = goalEvents.slice(-MAX_GOAL_EVENTS);
+  if (migrated || lines > MAX_GOAL_EVENTS) {
+    try {
+      fs.writeFileSync(goalLogFile, goalEvents.map(e => JSON.stringify([e.name, e.at])).join('\n') + (goalEvents.length ? '\n' : ''));
+      if (migrated) fs.renameSync(goalEventsFile, goalEventsFile + '.migrated');
+    } catch (e) { console.error('goal log migration failed:', e.message); }
+  }
+})();
 function recordGoal(name){
   const playerName = normalizeName(name);
   if(!playerName) return;
-  goalEvents.push({name:playerName, at:Date.now()});
-  if(goalEvents.length > 200000) goalEvents = goalEvents.slice(-200000);
-  saveGoalEvents();
+  const ev = {name:playerName, at:Date.now()};
+  goalEvents.push(ev);
+  fs.appendFile(goalLogFile, JSON.stringify([ev.name, ev.at]) + '\n', () => {});
+  if(goalEvents.length > MAX_GOAL_EVENTS + 20000){
+    goalEvents = goalEvents.slice(-MAX_GOAL_EVENTS);
+    try { fs.writeFileSync(goalLogFile, goalEvents.map(e => JSON.stringify([e.name, e.at])).join('\n') + '\n'); } catch {}
+  }
 }
 function leaderboardWindow(period){
   const now = new Date();
@@ -125,6 +155,18 @@ try { playerWallets = JSON.parse(fs.readFileSync(walletsFile, 'utf8')) || {}; } 
 const namesSaver = makeSaver(namesFile, () => reservedNames);
 const rewardSaver = makeSaver(rewardFile, () => rewardedAds);
 const walletsSaver = makeSaver(walletsFile, () => playerWallets);
+// Friends + pending requests used to live only in memory, so every restart/redeploy wiped them.
+const friendsFile = path.join(dataDir, 'friends.json');
+try {
+  const saved = JSON.parse(fs.readFileSync(friendsFile, 'utf8')) || {};
+  for (const [k, arr] of Object.entries(saved.friends || {})) friends.set(k, new Set(Array.isArray(arr) ? arr : []));
+  for (const [k, arr] of Object.entries(saved.requests || {})) friendRequests.set(k, new Set(Array.isArray(arr) ? arr : []));
+} catch {}
+const friendsSaver = makeSaver(friendsFile, () => ({
+  friends: Object.fromEntries([...friends].map(([k, v]) => [k, [...v]])),
+  requests: Object.fromEntries([...friendRequests].map(([k, v]) => [k, [...v]]))
+}));
+function saveFriends(){ friendsSaver.schedule(); }
 function saveReservedNames(){ namesSaver.schedule(); }
 function saveRewardedAds(){ rewardSaver.schedule(); }
 function saveWallets(){ walletsSaver.schedule(); }
@@ -135,7 +177,16 @@ try { playerStats = JSON.parse(fs.readFileSync(statsFile, 'utf8')) || {}; } catc
 const statsSaver = makeSaver(statsFile, () => playerStats);
 function cleanStats(st){ const games=Number(st?.gamesPlayed)||0,wins=Number(st?.wins)||0,losses=Number(st?.losses)||0,goals=Number(st?.goals)||0; return {gamesPlayed:games,wins,losses,goals,winRate:games?Math.round(wins/games*100):0}; }
 function saveStats(){ statsSaver.schedule(); }
+const leaderboardCache = new Map();
 function getLeaderboardRows(period='all'){
+  const p = String(period || 'all').toLowerCase();
+  const hit = leaderboardCache.get(p);
+  if (hit && Date.now() - hit.at < 3000) return hit.rows;
+  const rows = computeLeaderboardRows(p);
+  leaderboardCache.set(p, { at: Date.now(), rows });
+  return rows;
+}
+function computeLeaderboardRows(period='all'){
   const normalized = String(period || 'all').toLowerCase();
   let rows;
   if(normalized === 'weekly' || normalized === 'monthly'){
@@ -170,7 +221,7 @@ function startMatch(p1,p2,roomId){
   // The room keeps an immutable snapshot for this match. Each client receives
   // BOTH players' profiles, so the renderer never has to guess whose cosmetic belongs where.
   const payload=(side,self,opp)=>({
-    room:roomId,side,startAt,
+    room:roomId,side,startAt,serverNow:Date.now(),
     // Canonical match identities: left is always p1, right is always p2.
     leftProfile:p1Profile,
     rightProfile:p2Profile,
@@ -181,7 +232,7 @@ function startMatch(p1,p2,roomId){
   });
   p1.emit('match_found',payload('left',p1Profile,p2Profile));
   p2.emit('match_found',payload('right',p2Profile,p1Profile));
-  setTimeout(()=>{ const r=rooms[roomId]; if(!r||r.ended)return; r.ended=true; io.to(roomId).emit('game_ended',{reason:'Time up'}); setTimeout(()=>{ if(rooms[roomId]===r) delete rooms[roomId]; }, 5000); },2100+180000+250);
+  setTimeout(()=>{ const r=rooms[roomId]; if(!r||r.ended)return; r.ended=true; io.to(roomId).emit('game_ended',{reason:'Time up'}); setTimeout(()=>{ if(rooms[roomId]===r){ delete rooms[roomId]; io.in(roomId).socketsLeave(roomId); } }, 5000); },2100+180000+250);
 }
 
 function normalizeName(name) {
@@ -221,6 +272,7 @@ function containsViolentText(value) {
 async function moderateWithOpenAI(input) {
   if (!process.env.OPENAI_API_KEY) return {available:false, flagged:false};
   const response = await fetch('https://api.openai.com/v1/moderations', {
+    signal: AbortSignal.timeout(8000),
     method:'POST', headers:{'Authorization':'Bearer '+process.env.OPENAI_API_KEY,'Content-Type':'application/json'},
     body:JSON.stringify({model:'omni-moderation-latest',input})
   });
@@ -257,7 +309,9 @@ async function acceptModeratedProfile(socket, data={}) {
   if (avatar.startsWith('data:image/')) {
     if (avatar === socket.playerAvatar) avatarModerated=true;
     else {
-      const result=await moderateImageDataUrl(avatar);
+      let result;
+      try { result=await moderateImageDataUrl(avatar); }
+      catch(error) { console.error('Avatar moderation failed:',error.message); return {ok:false,message:'Image safety check failed. Please try again later.'}; }
       if (!result.available) return {ok:false,message:'Image moderation is not configured on the game server yet. Please try an approved avatar later.'};
       if (result.flagged) return {ok:false,message:'That avatar was blocked by safety moderation. Please choose a different image.'};
       avatarModerated=true;
@@ -267,6 +321,16 @@ async function acceptModeratedProfile(socket, data={}) {
   return acceptProfileForSocket(socket,profile);
 }
 function key(name) { return normalizeName(name).toLowerCase(); }
+// Friend/request sets store display names; compare them case-insensitively so "bob" and "Bob" are one person.
+function setFind(set, name) { const k = key(name); for (const v of set) if (key(v) === k) return v; return null; }
+function setRemove(set, name) { const v = setFind(set, name); if (v !== null) set.delete(v); }
+function makeFriends(a, b) {
+  ensureUser(a); ensureUser(b);
+  if (!setFind(friends.get(key(a)), b)) friends.get(key(a)).add(b);
+  if (!setFind(friends.get(key(b)), a)) friends.get(key(b)).add(a);
+  setRemove(friendRequests.get(key(a)), b); setRemove(friendRequests.get(key(b)), a);
+  saveFriends();
+}
 function ensureUser(name) {
   const k = key(name);
   if (!friends.has(k)) friends.set(k, new Set());
@@ -390,6 +454,7 @@ io.on('connection', (socket) => {
     emitWallet(socket);
   });
 
+  socket.on('latency_ping', (...args) => { const ack = args[args.length - 1]; if (typeof ack === 'function') ack(Date.now()); });
   socket.on('wallet_get', () => emitWallet(socket));
   socket.on('wallet_purchase', (data={},ack) => {
     const cat=String(data.category||'');const id=String(data.itemId||'');const costs=CUSTOM_ITEM_COSTS[cat];
@@ -418,38 +483,43 @@ io.on('connection', (socket) => {
 
   socket.on('stats_update', ({stats} = {}) => {
     const name = normalizeName(socket.playerName); if (!name) return;
-    const incoming=cleanStats(stats); const existing=cleanStats(playerStats[key(name)]); incoming.goals=Math.max(existing.goals,incoming.goals); incoming.name=name; playerStats[key(name)]=incoming; saveStats();
+    const incoming=cleanStats(stats); const existing=cleanStats(playerStats[key(name)]); for(const f of ['gamesPlayed','wins','losses','goals']) incoming[f]=Math.max(existing[f],incoming[f]); incoming.winRate=incoming.gamesPlayed?Math.round(incoming.wins/incoming.gamesPlayed*100):0; incoming.name=name; playerStats[key(name)]=incoming; saveStats();
     socket.emit('stats_updated', {name, stats: playerStats[key(name)]});
   });
 
   socket.on('friend_request', ({ name } = {}) => {
-    const target = normalizeName(name);
+    const typed = normalizeName(name);
     const from = normalizeName(socket.playerName);
-    if (!from || !target) return socket.emit('friend_error', { message: 'Enter a player name.' });
-    if (key(from) === key(target)) return socket.emit('friend_error', { message: 'You cannot add yourself.' });
-    const targetSocketId = onlineByName.get(key(target));
+    if (!from || !typed) return socket.emit('friend_error', { message: 'Enter a player name.' });
+    if (key(from) === key(typed)) return socket.emit('friend_error', { message: 'You cannot add yourself.' });
+    const targetSocketId = onlineByName.get(key(typed));
     if (!targetSocketId) return socket.emit('friend_error', { message: 'Player not found or offline.' });
+    const target = io.sockets.sockets.get(targetSocketId)?.playerName || typed; // canonical spelling
 
     ensureUser(from); ensureUser(target);
     if (friends.get(key(from)).size >= MAX_FRIENDS) return socket.emit('friend_error', { message: 'Friend limit reached (250).' });
     if (friends.get(key(target)).size >= MAX_FRIENDS) return socket.emit('friend_error', { message: 'That player has reached the 250 friend limit.' });
-    if (friends.get(key(from)).has(target)) return socket.emit('friend_error', { message: 'Already friends.' });
-    if (friendRequests.get(key(target)).has(from)) return socket.emit('friend_error', { message: 'Request already sent.' });
+    if (setFind(friends.get(key(from)), target)) return socket.emit('friend_error', { message: 'Already friends.' });
+    if (setFind(friendRequests.get(key(target)), from)) return socket.emit('friend_error', { message: 'Request already sent.' });
+    // They already asked us: sending a request back simply accepts it.
+    if (setFind(friendRequests.get(key(from)), target)) { makeFriends(from, target); emitFriendState(from); emitFriendState(target); return; }
 
     friendRequests.get(key(target)).add(from);
+    saveFriends();
     socket.emit('friend_request_sent', { name: target });
     emitFriendState(target);
   });
 
   socket.on('friend_accept', ({ name } = {}) => {
     const me = normalizeName(socket.playerName);
-    const other = normalizeName(name);
-    if (!me || !other) return;
-    ensureUser(me); ensureUser(other);
+    if (!me || !name) return;
+    ensureUser(me);
+    // SECURITY: only an existing pending request can be accepted (previously anyone could force a friendship).
+    const other = setFind(friendRequests.get(key(me)), normalizeName(name));
+    if (!other) return;
+    ensureUser(other);
     if (friends.get(key(me)).size >= MAX_FRIENDS || friends.get(key(other)).size >= MAX_FRIENDS) return socket.emit('friend_error',{message:'Friend limit reached (250).'});
-    friendRequests.get(key(me)).delete(other);
-    friends.get(key(me)).add(other);
-    friends.get(key(other)).add(me);
+    makeFriends(me, other);
     emitFriendState(me);
     emitFriendState(other);
   });
@@ -458,7 +528,8 @@ io.on('connection', (socket) => {
     const me = normalizeName(socket.playerName);
     if (!me || !name) return;
     ensureUser(me);
-    friendRequests.get(key(me)).delete(normalizeName(name));
+    setRemove(friendRequests.get(key(me)), normalizeName(name));
+    saveFriends();
     emitFriendState(me);
   });
 
@@ -485,7 +556,7 @@ io.on('connection', (socket) => {
       } catch(error) { console.error('Image moderation failed:',error.message); return socket.emit('chat_error',{message:'Image safety check failed. Please try again later.'}); }
     }
     ensureUser(from); ensureUser(to);
-    if (!friends.get(key(from)).has(to)) return;
+    if (!setFind(friends.get(key(from)), to)) return;
     const targetId = onlineByName.get(key(to));
     if (!targetId) return socket.emit('chat_error', { message: 'Friend is offline.' });
 
@@ -510,7 +581,7 @@ io.on('connection', (socket) => {
   socket.on('chat_history', ({with: other}={}) => {
     const me=normalizeName(socket.playerName), target=normalizeName(other);
     if(!me||!target) return; ensureUser(me);
-    if(!friends.get(key(me)).has(target)) return socket.emit('chat_history',[]);
+    if(!setFind(friends.get(key(me)), target)) return socket.emit('chat_history',[]);
     socket.emit('chat_history', chatHistory.get(chatKey(me,target)) || []);
   });
 
@@ -551,7 +622,7 @@ io.on('connection', (socket) => {
       const accepted=await acceptModeratedProfile(socket,data.profile);
       if(!accepted.ok) return socket.emit('name_taken',{message:accepted.message});
     }
-    if (inActiveRoom(socket)) return;
+    if (!socket.connected || inActiveRoom(socket)) return;
     // FIX: never pair with a waiting player whose connection has already dropped.
     if (waitingPlayer && !waitingPlayer.connected) waitingPlayer = null;
     if (waitingPlayer && waitingPlayer.id !== socket.id) {
@@ -594,40 +665,56 @@ io.on('connection', (socket) => {
     startMatch(p1Socket, socket, roomCode);
   });
 
-  // --- Realtime packets: volatile (dropped, not queued, when the link is congested)
-  // and only accepted from the correct player.
+  // --- Realtime packets: volatile (dropped, not queued, when the link is congested),
+  // only accepted from the correct player, rate-limited and clamped to that player's half.
+  const allowRealtime = () => {
+    const now = Date.now();
+    if (now - (socket._rtWindow || 0) >= 1000) { socket._rtWindow = now; socket._rtCount = 0; }
+    return ++socket._rtCount <= 240; // normal play is ~60/s
+  };
   socket.on('player_move', data => {
-    const room=rooms[data?.room]; if(!room||room.ended) return;
-    if(socket.id!==room.p1 && socket.id!==room.p2) return;
-    const x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return;
+    const room=rooms[data?.room]; if(!room||room.ended||!room.p2) return;
+    const isLeft = socket.id===room.p1;
+    if(!isLeft && socket.id!==room.p2) return;
+    if(!allowRealtime()) return;
+    let x=Number(data.x), y=Number(data.y); if(!Number.isFinite(x)||!Number.isFinite(y)) return;
+    x = isLeft ? Math.min(512, Math.max(0, x)) : Math.min(1024, Math.max(512, x));
+    y = Math.min(640, Math.max(0, y));
     socket.to(data.room).volatile.emit('opponent_move',{x,y});
   });
   socket.on('puck_update', data => {
     const room=rooms[data?.room]; if(!room||room.ended) return;
-    // FIX: only the puck authority (left / p1) may broadcast puck state. Previously any
-    // client in the room could overwrite the puck for everybody.
+    // Only the puck authority (left / p1) may broadcast puck state.
     if(socket.id!==room.p1) return;
+    if(!allowRealtime()) return;
     const x=Number(data.x), y=Number(data.y), vx=Number(data.vx), vy=Number(data.vy);
     if(![x,y,vx,vy].every(Number.isFinite)) return;
     if(x < -20 || x > 1044 || y < -20 || y > 660 || Math.abs(vx)>40 || Math.abs(vy)>40) return;
     room.lastPuckState={x,y,vx,vy,at:Date.now()};
     socket.to(data.room).volatile.emit('puck_update',{room:data.room,x,y,vx,vy});
   });
+  // A goal is plausible when the puck was at the correct end, inside the goal mouth, moving toward it.
+  const goalPlausible = (p, scorerSide) => p && [p.x,p.y,p.vx].every(Number.isFinite) && p.y>=250 && p.y<=390 &&
+    (scorerSide==='right' ? (p.x>=-40 && p.x<70 && p.vx<-0.05) : (p.x<=1064 && p.x>954 && p.vx>0.05));
   socket.on('score_update', data => {
     const room=rooms[data?.room]; if(!room || room.ended || !room.p2) return;
     // Only the left-side client simulates puck physics and may report a goal.
-    // This avoids both clients incrementing the score for the same puck crossing.
     if(socket.id !== room.p1) return;
     const scorerSide=data?.scorer;
     if(scorerSide!=='left' && scorerSide!=='right') return;
-    // Check a fresh host puck snapshot before allowing a goal/reward.
-    const puck=room.lastPuckState;const now=Date.now();
-    if(!puck||now-puck.at>250||puck.y<260||puck.y>380)return;
-    const plausible=scorerSide==='right'?(puck.x>=0&&puck.x<70&&puck.vx< -0.1):(puck.x<=1024&&puck.x>954&&puck.vx>0.1);
-    if(!plausible||now-(room.lastGoalAt||0)<GOAL_COOLDOWN_MS)return;
+    const now=Date.now();
+    if(now-(room.lastGoalAt||0)<GOAL_COOLDOWN_MS) return;
+    // FIX: the old check only looked at the last volatile puck snapshot (<=250ms old). One or two dropped
+    // packets, or a fast shot, made the server silently reject real goals. The host now sends the puck
+    // state at the moment of the goal; either that or a recent snapshot may prove it.
+    const reported = data.puck && { x:Number(data.puck.x), y:Number(data.puck.y), vx:Number(data.puck.vx), vy:Number(data.puck.vy) };
+    const recent = room.lastPuckState && now-room.lastPuckState.at<1500 ? room.lastPuckState : null;
+    if(!(goalPlausible(reported,scorerSide) || goalPlausible(recent,scorerSide))){
+      // Put the host's optimistic local score back in line with the server.
+      return socket.emit('score_sync', {room:data.room, scores:{...room.scores}});
+    }
     room.lastGoalAt=now;
     if(!room.scores) room.scores={left:0,right:0};
-    // Accept exactly one goal at a time; ignore stale, duplicate, or fabricated score totals.
     room.scores[scorerSide] += 1;
     const scorerId=scorerSide==='left'?room.p1:room.p2;
     const scorer=io.sockets.sockets.get(scorerId);
