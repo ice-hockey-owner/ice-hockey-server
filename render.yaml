@@ -3,6 +3,7 @@ services:
     name: ice-hockey-server
     runtime: node
     plan: starter
+    region: singapore   # closest Render region to India; far regions cause 400-800 ms ping
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
