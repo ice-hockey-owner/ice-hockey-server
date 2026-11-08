@@ -1,0 +1,11 @@
+node_modules/
+*.tmp
+*.migrated
+# runtime data - keep out of git (and out of public repos)
+player-stats.json
+reserved-names.json
+rewarded-ads.json
+player-wallets.json
+friends.json
+goal-events.json
+goal-events.log
